@@ -33,3 +33,4 @@ psycopg2-binary>=2.9.0
 # Web UI (for labeling system)
 gradio>=4.0.0
 pyngrok>=7.0.0
+python-dotenv>=1.0.0

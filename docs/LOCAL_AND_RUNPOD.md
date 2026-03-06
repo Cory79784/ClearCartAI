@@ -328,17 +328,57 @@ cd Ean-System/ean_system_new
 
 Project root = `ean_system_new/`.
 
-## 3.5 Environment variables on RunPod
+## 3.5 Database on RunPod — where it’s stored
 
-Set in the pod’s environment or startup script:
+The labeling UI needs a database for products, images, and labels. You can use **SQLite** (single file, good for one pod) or **PostgreSQL** (for multi-pod or existing Postgres).
 
-**Database (required for labeling UI):**
+### Option A: SQLite on your persistent volume (recommended for one pod)
+
+**Where it’s stored:** One file, e.g. `/data/labeling.db` on your mounted volume. Survives pod restarts as long as the volume is mounted at `/data`.
+
+1. In RunPod, **mount a persistent volume** at `/data` (or another path you prefer).
+2. Set in the pod environment or before starting the app:
+
+```bash
+export DATABASE_URL="sqlite:////data/labeling.db"
+```
+
+(Use four slashes: `sqlite:///` + absolute path `/data/labeling.db`.)
+
+3. Create the directory if needed: `mkdir -p /data`
+4. Start the UI as usual; the app will create the tables on first run.
+
+**Summary:** Database file = `/data/labeling.db` (or whatever path you put in `DATABASE_URL`). Keep that path on your **persistent volume** so it isn’t lost when the pod is recreated.
+
+### Option B: PostgreSQL (managed or separate pod)
+
+**Where it’s stored:** On the Postgres server (e.g. RunPod Postgres template, Neon, Supabase, or a second pod running Postgres). The RunPod app only connects to it; it doesn’t store the DB on the pod disk.
+
+Set in the pod environment:
 
 ```text
 DATABASE_URL=postgresql://user:password@db-host:5432/dbname
 ```
 
-Use a managed Postgres or a separate pod; the labeling UI must be able to reach it.
+- **db-host**: IP or hostname of the Postgres server (must be reachable from the pod).
+- Create the database and user on that server; the app creates tables on first run.
+
+Use this if you want one database shared by several pods or already use Postgres.
+
+### If you don’t set DATABASE_URL
+
+The app falls back to **SQLite** at `ean_system_new/data/labeling.db` (inside the project directory). On RunPod that path is usually on **ephemeral** disk, so the database can be lost when the pod is recreated. Prefer Option A or B above.
+
+---
+
+## 3.6 Environment variables on RunPod
+
+Set in the pod’s environment or startup script:
+
+**Database (choose one):**
+
+- **SQLite on volume:** `DATABASE_URL=sqlite:////data/labeling.db` (see 3.5 Option A)
+- **PostgreSQL:** `DATABASE_URL=postgresql://user:password@db-host:5432/dbname`
 
 **Paths (optional):**
 
@@ -358,7 +398,7 @@ PS_DTYPE=bfloat16
 PS_SIMILARITY_THRESHOLD=0.7
 ```
 
-## 3.6 Install dependencies in the pod
+## 3.7 Install dependencies in the pod
 
 ```bash
 cd /workspace/ClearCartAI   # or your repo path
@@ -379,7 +419,7 @@ First run will download SAM2 and DINOv2 (~10 GB). Optional pre-warm:
 python tests/test_setup.py
 ```
 
-## 3.7 Start the Gradio UI on RunPod
+## 3.8 Start the Gradio UI on RunPod
 
 ```bash
 cd /workspace/ClearCartAI
@@ -390,7 +430,7 @@ python tools/label_ui_gradio.py
 - Expose **port 7860** in the RunPod pod settings.  
 - Use the RunPod HTTP URL for the app in your browser.
 
-## 3.8 Accessing the UI from anywhere
+## 3.9 Accessing the UI from anywhere
 
 Once the app is running and port **7860** is exposed in the RunPod dashboard, you can open the UI from **any device or location** (phone, another PC, different network). No VPN is required.
 
@@ -401,18 +441,18 @@ Once the app is running and port **7860** is exposed in the RunPod dashboard, yo
 
 **Security:** The Gradio UI has no built-in authentication. Anyone with the URL can use it. For sensitive data, prefer RunPod’s **HTTPS** URLs when available, and consider putting the app behind a reverse proxy with auth or using a VPN if you need access control.
 
-## 3.9 Optional: pipeline scripts on the same pod
+## 3.10 Optional: pipeline scripts on the same pod
 
 ```bash
 python scripts/run_interactive.py --image-dir ./path/to/images --output ./outputs
 python scripts/run_batch.py --image-dir ./path/to/images --reference img_001.jpg --point 250 300 --output ./outputs
 ```
 
-## 3.10 RunPod checklist
+## 3.11 RunPod checklist
 
 - [ ] GPU ≥ 16 GB VRAM, RAM ≥ 16 GB, Disk ≥ 30–50 GB  
-- [ ] `DATABASE_URL` set and reachable from the pod  
-- [ ] Volume mounted for `RAW_ROOT_DIR` and `OUTPUT_ROOT_DIR`  
+- [ ] **Database:** `DATABASE_URL` set (e.g. `sqlite:////data/labeling.db` on volume, or PostgreSQL URL)  
+- [ ] **Volume** mounted (e.g. at `/data`) for DB and for `RAW_ROOT_DIR` / `OUTPUT_ROOT_DIR`  
 - [ ] Dependencies installed (requirements, PyTorch CUDA, SAM2)  
 - [ ] `python tools/label_ui_gradio.py` running, port **7860** exposed  
 

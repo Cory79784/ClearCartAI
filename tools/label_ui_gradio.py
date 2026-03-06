@@ -19,6 +19,7 @@ Environment variables:
 import os
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 import zipfile
 import tempfile
 import shutil
@@ -558,7 +559,14 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
+    load_dotenv(PROJECT_ROOT / ".env")
+    _u = os.environ.get("GRADIO_USERNAME")
+    _p = os.environ.get("GRADIO_PASSWORD")
+    if not _u or not _p:
+        raise SystemExit("GRADIO_USERNAME and GRADIO_PASSWORD must be set (e.g. in .env).")
+
     demo = build_ui()
+    _auth = [(_u, _p)]
 
     if args.public:
         import threading
@@ -570,6 +578,7 @@ if __name__ == '__main__':
                 server_name="0.0.0.0",
                 server_port=7860,
                 share=False,
+                auth=_auth,
             )
 
         thread = threading.Thread(target=run_app, daemon=True)
@@ -607,4 +616,5 @@ if __name__ == '__main__':
             server_name="0.0.0.0",
             server_port=7860,
             share=True,
+            auth=_auth,
         )

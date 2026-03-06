@@ -8,7 +8,10 @@ Tables:
 - labels: labeling results with mask/cutout paths
 
 Environment variables:
-- DATABASE_URL: PostgreSQL connection string (required)
+- DATABASE_URL: Database URL (optional). Examples:
+  - PostgreSQL: postgresql://user:password@host:5432/dbname
+  - SQLite (custom path): sqlite:////absolute/path/to/labeling.db
+  If unset, uses SQLite at project data/labeling.db.
 - LOCK_MINUTES: Lock timeout in minutes (default: 30)
 """
 
