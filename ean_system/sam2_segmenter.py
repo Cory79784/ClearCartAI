@@ -9,9 +9,18 @@ Provides two segmentation modes:
 import numpy as np
 import torch
 from typing import List, Tuple, Optional, Dict, Any
+from contextlib import nullcontext
 
 from . import config
 from .model_loader import ModelLoader
+
+
+def _autocast_or_noop():
+    device = config.get_device()
+    # CPU autocast with unsupported dtype emits warnings and disables itself.
+    if str(device) == "cpu":
+        return nullcontext()
+    return torch.autocast(str(device), dtype=config.get_dtype())
 
 
 class SAM2InteractiveSegmenter:
@@ -28,9 +37,7 @@ class SAM2InteractiveSegmenter:
             image: RGB numpy array, shape (H, W, 3), dtype uint8
         """
         self._current_image = image
-        with torch.inference_mode(), torch.autocast(
-            str(config.get_device()), dtype=config.get_dtype()
-        ):
+        with torch.inference_mode(), _autocast_or_noop():
             self.predictor.set_image(image)
 
     def segment_with_points(
@@ -51,9 +58,7 @@ class SAM2InteractiveSegmenter:
             scores: (K,) predicted IoU scores
             logits: (K, 256, 256) low-res mask logits (for refinement)
         """
-        with torch.inference_mode(), torch.autocast(
-            str(config.get_device()), dtype=config.get_dtype()
-        ):
+        with torch.inference_mode(), _autocast_or_noop():
             masks, scores, logits = self.predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
@@ -74,9 +79,7 @@ class SAM2InteractiveSegmenter:
         Returns:
             masks, scores, logits (same as segment_with_points)
         """
-        with torch.inference_mode(), torch.autocast(
-            str(config.get_device()), dtype=config.get_dtype()
-        ):
+        with torch.inference_mode(), _autocast_or_noop():
             masks, scores, logits = self.predictor.predict(
                 box=box[None, :],  # (1, 4)
                 multimask_output=multimask_output,
@@ -99,9 +102,7 @@ class SAM2InteractiveSegmenter:
         Returns:
             Refined masks, scores, logits
         """
-        with torch.inference_mode(), torch.autocast(
-            str(config.get_device()), dtype=config.get_dtype()
-        ):
+        with torch.inference_mode(), _autocast_or_noop():
             masks, scores, logits = self.predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
@@ -144,9 +145,7 @@ class SAM2AutoSegmenter:
             max_area_ratio = config.MAX_MASK_AREA_RATIO
 
         # Generate all masks
-        with torch.inference_mode(), torch.autocast(
-            str(config.get_device()), dtype=config.get_dtype()
-        ):
+        with torch.inference_mode(), _autocast_or_noop():
             raw_masks = self.generator.generate(image)
 
         # Filter by area
