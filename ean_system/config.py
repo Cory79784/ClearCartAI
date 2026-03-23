@@ -40,7 +40,7 @@ MIN_MASK_AREA_RATIO = float(os.getenv("PS_MIN_MASK_AREA_RATIO", "0.001"))
 MAX_MASK_AREA_RATIO = float(os.getenv("PS_MAX_MASK_AREA_RATIO", "0.5"))
 
 # ─── Device Configuration ────────────────────────────────────
-DEVICE = os.getenv("PS_DEVICE", "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") != "" else "auto")
+DEVICE = os.getenv("PS_DEVICE", "auto")
 DTYPE = os.getenv("PS_DTYPE", "bfloat16")  # bfloat16, float16, or float32
 
 # ─── UI Configuration ────────────────────────────────────────
@@ -70,6 +70,10 @@ def get_device():
 def get_dtype():
     """Resolve the torch dtype."""
     import torch
+    device = get_device()
+    # CPU execution is most stable with float32.
+    if device.type == "cpu":
+        return torch.float32
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,

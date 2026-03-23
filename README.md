@@ -215,8 +215,45 @@ For each run, the pipeline writes under the chosen output directory:
 - **docs/RUNPOD.md** — RunPod-only deployment reference.
 - **docs/DEVELOPMENT_PLAN.md** — Architecture, SAM2 + DINOv2 rationale, and module specs.
 - **docs/CHANGELOG_2026-02-18.md** — Labeling UI and database changes.
+- **docs/architecture.md** — New FastAPI + Next.js integration architecture.
+- **docs/developer_guide.md** — How to run backend/frontend/Gradio.
+- **docs/api_usage.md** — API endpoint reference.
+- **docs/deployment_plan.md** — Deployment and AWS migration plan.
+- **docs/migration_notes.md** — What changed and what remains.
 
 ---
+
+## New Web Stack (FastAPI + Next.js)
+
+Production-oriented web layers were added around the existing ML system:
+
+- Backend: `backend/app` (FastAPI)
+- Frontend: `frontend` (Next.js)
+- Shared ML bridge: `backend/app/ml_bridge/adapter.py`
+- Existing Gradio app remains available: `tools/label_ui_gradio.py`
+
+### Backend quick start
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### Frontend quick start
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+### Security baseline in backend
+
+- Authentication required for upload and jobs.
+- Hardcoded admin login (phase requirement): `admin / nikhil@123`.
+- Secure ZIP checks (size, members, zip-slip defense, image-type filtering).
+- Queue-based async jobs with max **2** active inference jobs.
 
 ## License and credits
 
