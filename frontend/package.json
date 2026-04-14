@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "next dev",
+    "dev": "node scripts/print-dev-urls.js && next dev",
     "build": "next build",
     "start": "next start"
   },

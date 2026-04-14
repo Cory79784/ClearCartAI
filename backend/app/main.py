@@ -1,3 +1,5 @@
+import os
+from logging import getLogger
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -13,6 +15,7 @@ from app.utils.paths import ensure_storage_dirs
 
 configure_logging()
 ensure_storage_dirs()
+logger = getLogger(__name__)
 
 app = FastAPI(title=settings.app_name, docs_url="/docs", redoc_url=None)
 
@@ -33,6 +36,13 @@ async def unhandled_exception_handler(_: Request, __: Exception):
 @app.on_event("startup")
 async def startup_event() -> None:
     await queue_manager.start()
+    pod_id = os.getenv("RUNPOD_POD_ID") or os.getenv("POD_ID")
+
+    logger.info("Backend local URL: http://localhost:8000")
+    if pod_id:
+        logger.info("Backend RunPod proxy URL: https://%s-8000.proxy.runpod.net", pod_id)
+    else:
+        logger.info("Backend RunPod proxy URL: unavailable (RUNPOD_POD_ID not set)")
 
 
 @app.on_event("shutdown")
