@@ -21,7 +21,8 @@ app = FastAPI(title=settings.app_name, docs_url="/docs", redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    allow_origins=settings.cors_origins,
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
@@ -43,6 +44,7 @@ async def startup_event() -> None:
         logger.info("Backend RunPod proxy URL: https://%s-8000.proxy.runpod.net", pod_id)
     else:
         logger.info("Backend RunPod proxy URL: unavailable (RUNPOD_POD_ID not set)")
+    logger.info("Uvicorn bind address may show 0.0.0.0:8000; this is expected for external access.")
 
 
 @app.on_event("shutdown")
