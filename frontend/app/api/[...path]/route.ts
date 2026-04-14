@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 function resolveBackendBase(req: NextRequest): string {
-  const configured = process.env.NEXT_PUBLIC_API_BASE?.trim();
+  const configured = process.env.BACKEND_API_BASE?.trim() || process.env.NEXT_PUBLIC_API_BASE?.trim();
   if (configured) {
     return configured.replace(/\/+$/, "");
   }

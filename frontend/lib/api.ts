@@ -1,8 +1,4 @@
 function resolveApiBase(): string {
-  const configured = process.env.NEXT_PUBLIC_API_BASE?.trim();
-  if (configured) {
-    return configured.replace(/\/+$/, "");
-  }
   // Default to same-origin proxy route to avoid cross-origin cookie/CORS issues.
   return "/api";
 }
