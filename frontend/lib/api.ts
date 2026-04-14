@@ -3,19 +3,8 @@ function resolveApiBase(): string {
   if (configured) {
     return configured.replace(/\/+$/, "");
   }
-
-  if (typeof window !== "undefined") {
-    const { protocol, hostname } = window.location;
-
-    // On RunPod, frontend is typically <podid>-3000.proxy.runpod.net.
-    // Derive backend as the matching <podid>-8000.proxy.runpod.net.
-    const runpodHost = hostname.match(/^(.*)-3000\.proxy\.runpod\.net$/);
-    if (runpodHost) {
-      return `${protocol}//${runpodHost[1]}-8000.proxy.runpod.net/api`;
-    }
-  }
-
-  return "http://localhost:8000/api";
+  // Default to same-origin proxy route to avoid cross-origin cookie/CORS issues.
+  return "/api";
 }
 
 export const API_BASE = resolveApiBase();

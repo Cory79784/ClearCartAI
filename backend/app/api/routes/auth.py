@@ -9,16 +9,9 @@ from app.schemas.auth import LoginRequest, LoginResponse
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-def _cookie_settings(request: Request) -> tuple[str | None, bool]:
-    host = request.headers.get("host", "").split(":")[0].lower()
+def _cookie_settings(request: Request) -> bool:
     forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
-    is_https = forwarded_proto == "https" or request.url.scheme == "https"
-
-    # Share auth cookie across RunPod proxy subdomains (e.g. -3000 / -8000).
-    if host.endswith(".proxy.runpod.net"):
-        return ".proxy.runpod.net", is_https
-
-    return None, False
+    return forwarded_proto == "https" or request.url.scheme == "https"
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -34,7 +27,7 @@ def login(payload: LoginRequest, request: Request, response: Response) -> LoginR
         role = user["role"]
 
     token = create_session_token(payload.username, role=role)
-    cookie_domain, cookie_secure = _cookie_settings(request)
+    cookie_secure = _cookie_settings(request)
 
     response.set_cookie(
         key=COOKIE_NAME,
@@ -43,15 +36,14 @@ def login(payload: LoginRequest, request: Request, response: Response) -> LoginR
         secure=cookie_secure,
         samesite="lax",
         max_age=60 * 60 * 12,
-        domain=cookie_domain,
     )
     return LoginResponse(ok=True, username=payload.username, role=role)
 
 
 @router.post("/logout")
 def logout(request: Request, response: Response) -> dict:
-    cookie_domain, cookie_secure = _cookie_settings(request)
-    response.delete_cookie(COOKIE_NAME, domain=cookie_domain, secure=cookie_secure, samesite="lax")
+    cookie_secure = _cookie_settings(request)
+    response.delete_cookie(COOKIE_NAME, secure=cookie_secure, samesite="lax")
     return {"ok": True}
 
 
