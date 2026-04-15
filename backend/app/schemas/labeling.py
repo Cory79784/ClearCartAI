@@ -26,3 +26,21 @@ class LabelingSaveRequest(BaseModel):
     session_id: str
     packaging: str = ""
     product_name: str = ""
+
+
+class AcceptProposedRequest(BaseModel):
+    label_id: int
+    packaging: str = ""
+    product_name: str = ""
+    labeler_id: str = "anonymous"
+
+
+class RejectProposedRequest(BaseModel):
+    image_id: int
+
+
+class AcceptAllProposedRequest(BaseModel):
+    product_id: int
+    packaging: str = ""
+    product_name: str = ""
+    labeler_id: str = "anonymous"

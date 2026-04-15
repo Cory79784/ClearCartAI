@@ -22,8 +22,8 @@ from typing import Optional, Dict, List, Tuple
 import logging
 
 from sqlalchemy import (
-    create_engine, MetaData, Table, Column, Integer, String, 
-    Float, Boolean, DateTime, ForeignKey, Index, text, select
+    create_engine, MetaData, Table, Column, Integer, String,
+    Float, Boolean, DateTime, ForeignKey, Index, text, select, func
 )
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -68,6 +68,7 @@ labels_table = Table(
     Column('mask_relpath', String, nullable=True),
     Column('cutout_relpath', String, nullable=True),
     Column('overlay_relpath', String, nullable=True),
+    Column('status', String, default='confirmed', nullable=True),
     Column('similarity_score', Float, nullable=True),
     Column('created_by', String, nullable=True),
     Column('created_at', DateTime, default=datetime.utcnow),
@@ -102,6 +103,12 @@ def init_db():
     try:
         engine = get_engine()
         _metadata.create_all(engine)
+        # Migration: add status column to labels if missing (for existing DBs)
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE labels ADD COLUMN status TEXT DEFAULT 'confirmed'"))
+        except Exception:
+            pass  # Column already exists
         logger.info("Database tables initialized successfully")
     except SQLAlchemyError as e:
         logger.error(f"Failed to initialize database: {e}")
@@ -234,13 +241,14 @@ def ingest_dataset(root_dir: str) -> Dict[str, int]:
     return {'products': products_count, 'images': images_count}
 
 
-def ingest_product_folder(root_dir: str, product_subfolder: str) -> Dict[str, int]:
+def ingest_product_folder(root_dir: str, product_subfolder: str, name_override: Optional[str] = None) -> Dict[str, int]:
     """
     Ingest a single product folder (used after upload).
     
     Args:
         root_dir: Root directory path
         product_subfolder: Subfolder name (relative to root_dir)
+        name_override: Optional display name; falls back to folder name if not provided
     
     Returns: {'products': count, 'images': count}
     """
@@ -251,7 +259,7 @@ def ingest_product_folder(root_dir: str, product_subfolder: str) -> Dict[str, in
         raise ValueError(f"Product folder does not exist: {product_folder}")
     
     folder_relpath = product_folder.relative_to(root_path).as_posix()
-    product_name = product_folder.name
+    product_name = name_override.strip() if name_override and name_override.strip() else product_folder.name
     supported_exts = {'.jpg', '.jpeg', '.png'}
     
     product_id = upsert_product(folder_relpath, product_name)
@@ -293,7 +301,10 @@ def get_next_unlabeled_image(
                 (images_table.c.locked_at < lock_timeout)
             ).order_by(
                 images_table.c.id
-            ).limit(1).with_for_update(skip_locked=True)
+            ).limit(1)
+            # skip_locked is not supported by SQLite; only use with PostgreSQL
+            if engine.dialect.name != 'sqlite':
+                query = query.with_for_update(skip_locked=True)
             
             result = conn.execute(query).fetchone()
             
@@ -328,7 +339,8 @@ def save_label(
     cutout_relpath: str,
     overlay_relpath: Optional[str] = None,
     similarity_score: Optional[float] = None,
-    created_by: Optional[str] = None
+    created_by: Optional[str] = None,
+    status: str = 'confirmed',
 ) -> int:
     """
     Save label and mark image as labeled.
@@ -347,18 +359,20 @@ def save_label(
                     mask_relpath=mask_relpath,
                     cutout_relpath=cutout_relpath,
                     overlay_relpath=overlay_relpath,
+                    status=status,
                     similarity_score=similarity_score,
                     created_by=created_by
                 )
             )
             label_id = result.inserted_primary_key[0]
             
-            # Update image status and clear lock
+            # Update image status: confirmed -> labeled, proposed keeps 'proposed'
+            image_status = 'labeled' if status == 'confirmed' else status
             conn.execute(
                 images_table.update().where(
                     images_table.c.id == image_id
                 ).values(
-                    status='labeled',
+                    status=image_status,
                     assigned_to=None,
                     locked_at=None
                 )
@@ -369,6 +383,169 @@ def save_label(
             
     except SQLAlchemyError as e:
         logger.error(f"Failed to save label for image {image_id}: {e}")
+        raise
+
+
+def get_images_by_product(
+    product_id: int,
+    exclude_statuses: Optional[List[str]] = None,
+) -> List[Tuple[int, str, str]]:
+    """
+    Get all images belonging to a product.
+
+    Args:
+        product_id: Product ID to query
+        exclude_statuses: Image statuses to skip (e.g. ['labeled', 'skipped'])
+
+    Returns: List of (image_id, image_relpath, status)
+    """
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            query = select(
+                images_table.c.id,
+                images_table.c.image_relpath,
+                images_table.c.status,
+            ).where(
+                images_table.c.product_id == product_id
+            )
+            if exclude_statuses:
+                query = query.where(
+                    images_table.c.status.notin_(exclude_statuses)
+                )
+            results = conn.execute(query).fetchall()
+            return [(row[0], row[1], row[2]) for row in results]
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to get images for product {product_id}: {e}")
+        raise
+
+
+def get_proposed_labels(product_id: Optional[int] = None) -> List[Dict]:
+    """
+    Get all labels with status='proposed', optionally filtered by product_id.
+
+    Returns list of dicts with keys:
+        label_id, image_id, product_id, image_relpath, overlay_relpath,
+        similarity_score, created_by, created_at
+    """
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            query = (
+                select(
+                    labels_table.c.id.label('label_id'),
+                    labels_table.c.image_id,
+                    labels_table.c.overlay_relpath,
+                    labels_table.c.mask_relpath,
+                    labels_table.c.similarity_score,
+                    labels_table.c.created_by,
+                    labels_table.c.created_at,
+                    images_table.c.image_relpath,
+                    images_table.c.product_id,
+                )
+                .join(images_table, labels_table.c.image_id == images_table.c.id)
+                .where(labels_table.c.status == 'proposed')
+            )
+            if product_id is not None:
+                query = query.where(images_table.c.product_id == product_id)
+            rows = conn.execute(query).fetchall()
+            return [
+                {
+                    'label_id': r.label_id,
+                    'image_id': r.image_id,
+                    'product_id': r.product_id,
+                    'image_relpath': r.image_relpath,
+                    'overlay_relpath': r.overlay_relpath,
+                    'mask_relpath': r.mask_relpath,
+                    'similarity_score': r.similarity_score,
+                    'created_by': r.created_by,
+                }
+                for r in rows
+            ]
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to get proposed labels: {e}")
+        raise
+
+
+def confirm_label(label_id: int, packaging: str, product_name: str, confirmed_by: str) -> None:
+    """
+    Accept a proposed label: update labels.status → 'confirmed', images.status → 'labeled'.
+    """
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            # Get image_id from label
+            row = conn.execute(
+                select(labels_table.c.image_id).where(labels_table.c.id == label_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Label {label_id} not found")
+            image_id = row[0]
+
+            conn.execute(
+                labels_table.update().where(labels_table.c.id == label_id).values(
+                    status='confirmed',
+                    packaging=packaging,
+                    product_name=product_name,
+                    created_by=confirmed_by,
+                )
+            )
+            conn.execute(
+                images_table.update().where(images_table.c.id == image_id).values(
+                    status='labeled',
+                )
+            )
+            logger.info(f"Confirmed label {label_id} for image {image_id}")
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to confirm label {label_id}: {e}")
+        raise
+
+
+def reject_proposed_label(image_id: int) -> None:
+    """
+    Reject a proposed label: delete the label row, reset images.status → 'unlabeled'.
+    """
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                labels_table.delete().where(
+                    (labels_table.c.image_id == image_id) &
+                    (labels_table.c.status == 'proposed')
+                )
+            )
+            conn.execute(
+                images_table.update().where(images_table.c.id == image_id).values(
+                    status='unlabeled',
+                    assigned_to=None,
+                    locked_at=None,
+                )
+            )
+            logger.info(f"Rejected proposed label for image {image_id}")
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to reject proposed label for image {image_id}: {e}")
+        raise
+
+
+def get_product_progress(product_id: int) -> Dict:
+    """Return {product_id, total, done} for the labeling progress bar."""
+    engine = get_engine()
+    try:
+        with engine.connect() as conn:
+            total = conn.execute(
+                select(func.count(images_table.c.id)).where(
+                    images_table.c.product_id == product_id
+                )
+            ).scalar() or 0
+            done = conn.execute(
+                select(func.count(images_table.c.id)).where(
+                    images_table.c.product_id == product_id,
+                    images_table.c.status.in_(["labeled", "proposed"])
+                )
+            ).scalar() or 0
+            return {"product_id": product_id, "total": total, "done": done}
+    except SQLAlchemyError as e:
+        logger.error(f"Failed to get progress for product {product_id}: {e}")
         raise
 
 

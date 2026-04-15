@@ -20,6 +20,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from ean_system import db, config
 from ean_system.sam2_segmenter import SAM2InteractiveSegmenter
 from ean_system.image_utils import load_image, apply_mask_overlay
+from ean_system.dinov2_embedder import DINOv2Embedder
+from ean_system.matcher import InstanceMatcher
 
 
 RAW_ROOT_DIR = os.getenv("RAW_ROOT_DIR", "/data/raw_products")
@@ -27,6 +29,8 @@ OUTPUT_ROOT_DIR = os.getenv("OUTPUT_ROOT_DIR", "/data/labels_output")
 LOCK_MINUTES = int(os.getenv("LOCK_MINUTES", "30"))
 LABELING_MAX_SIZE = int(os.getenv("LABELING_MAX_SIZE", "1024"))
 PRECOMPUTE_ON_LOAD = os.getenv("PRECOMPUTE_ON_LOAD", "1") == "1"
+AUTO_ANNOTATE_ENABLED = os.getenv("AUTO_ANNOTATE_ENABLED", "1") == "1"
+MAX_AUTO_ANNOTATE_SIBLINGS = int(os.getenv("MAX_AUTO_ANNOTATE_SIBLINGS", "20"))
 
 
 def _ensure_dirs() -> None:
@@ -52,6 +56,18 @@ class LabelingService:
         self.segmenter: SAM2InteractiveSegmenter | None = None
         self.sessions: dict[str, dict[str, Any]] = {}
         self._segmenter_loaded_image_id: int | None = None
+        self._embedder: DINOv2Embedder | None = None
+        self._matcher: InstanceMatcher | None = None
+
+    def _get_embedder(self) -> DINOv2Embedder:
+        if self._embedder is None:
+            self._embedder = DINOv2Embedder()
+        return self._embedder
+
+    def _get_matcher(self) -> InstanceMatcher:
+        if self._matcher is None:
+            self._matcher = InstanceMatcher()
+        return self._matcher
 
     def _get_segmenter(self) -> SAM2InteractiveSegmenter:
         if self.segmenter is None:
@@ -70,7 +86,7 @@ class LabelingService:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def upload_and_ingest(self, zip_path: Path, uploader_name: str) -> str:
+    def upload_and_ingest(self, zip_path: Path, uploader_name: str, original_filename: str = "", product_name_override: str = "") -> str:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -80,18 +96,25 @@ class LabelingService:
                         return f"❌ Security error: Invalid path in ZIP: {member}"
                 zip_ref.extractall(temp_path)
 
-            extracted_items = list(temp_path.iterdir())
+            # Filter out Mac __MACOSX and other hidden/system entries
+            extracted_items = [
+                p for p in temp_path.iterdir()
+                if not p.name.startswith('.') and p.name != '__MACOSX'
+            ]
             if len(extracted_items) == 0:
                 return "❌ ZIP file is empty"
 
             if len(extracted_items) == 1 and extracted_items[0].is_dir():
                 product_folder = extracted_items[0]
+                inferred_name = product_folder.name
             else:
                 product_folder = temp_path / "uploaded_product"
                 product_folder.mkdir()
                 for item in extracted_items:
                     shutil.move(str(item), str(product_folder))
+                inferred_name = os.path.splitext(original_filename)[0] if original_filename else "uploaded_product"
 
+            final_name = product_name_override.strip() if product_name_override.strip() else inferred_name
             product_name = product_folder.name
             target_path = Path(RAW_ROOT_DIR) / product_name
             counter = 1
@@ -100,7 +123,7 @@ class LabelingService:
                 counter += 1
 
             shutil.move(str(product_folder), str(target_path))
-            result = db.ingest_product_folder(RAW_ROOT_DIR, target_path.name)
+            result = db.ingest_product_folder(RAW_ROOT_DIR, target_path.name, name_override=final_name)
             stats = db.get_stats()
             return (
                 f"✅ Upload successful!\n\n"
@@ -165,6 +188,7 @@ class LabelingService:
         return {
             "session_id": sid,
             "image": _image_to_b64_png(image),
+            "product_id": product_id,
             "status": (
                 f"✅ Loaded image {image_id}\nPath: {image_relpath}\n"
                 f"Remaining: {stats['unlabeled_images']} unlabeled images"
@@ -212,6 +236,163 @@ class LabelingService:
                 "image": _image_to_b64_png(state.get("image_array")),
                 "status": f"❌ Segmentation failed: {str(e)}",
             }
+
+    def auto_annotate_product(
+        self,
+        image_id: int,
+        image: np.ndarray,
+        mask: np.ndarray,
+        product_id: int,
+    ) -> None:
+        """Auto-annotate remaining unlabeled images of the same product using DINOv2 matching."""
+        if not AUTO_ANNOTATE_ENABLED:
+            print("[AutoAnnotate] Disabled via AUTO_ANNOTATE_ENABLED=0")
+            return
+        try:
+            ref_embedding = self._get_embedder().compute_ffa_embedding(image, mask)
+
+            sibling_images = db.get_images_by_product(
+                product_id, exclude_statuses=["labeled", "skipped", "proposed"]
+            )
+            targets = [(iid, rp) for iid, rp, _ in sibling_images if iid != image_id]
+
+            if not targets:
+                print(f"[AutoAnnotate] No unlabeled siblings for product {product_id}")
+                return
+
+            if len(targets) > MAX_AUTO_ANNOTATE_SIBLINGS:
+                print(f"[AutoAnnotate] Too many siblings ({len(targets)} > {MAX_AUTO_ANNOTATE_SIBLINGS}), skipping")
+                return
+
+            print(f"[AutoAnnotate] Auto-annotating {len(targets)} images for product {product_id}")
+
+            masks_dir = Path(OUTPUT_ROOT_DIR) / "masks"
+            cutouts_dir = Path(OUTPUT_ROOT_DIR) / "cutouts"
+            overlays_dir = Path(OUTPUT_ROOT_DIR) / "overlays"
+            masks_dir.mkdir(parents=True, exist_ok=True)
+            cutouts_dir.mkdir(parents=True, exist_ok=True)
+            overlays_dir.mkdir(parents=True, exist_ok=True)
+
+            for target_id, target_relpath in targets:
+                try:
+                    target_path = Path(RAW_ROOT_DIR) / target_relpath
+                    if not target_path.exists():
+                        print(f"[AutoAnnotate] File not found: {target_path}")
+                        continue
+
+                    target_image = load_image(str(target_path), max_size=LABELING_MAX_SIZE)
+                    result = self._get_matcher().match_in_image(
+                        target_image, ref_embedding, str(target_path)
+                    )
+
+                    if not result.best_match or result.best_match.similarity < 0.7:
+                        print(f"[AutoAnnotate] No confident match for image {target_id} "
+                              f"(best={result.best_match.similarity:.3f if result.best_match else 'N/A'})")
+                        continue
+
+                    best = result.best_match
+
+                    mask_filename = f"{target_id}.png"
+                    mask_path = masks_dir / mask_filename
+                    mask_relpath = f"masks/{mask_filename}"
+                    Image.fromarray((best.mask * 255).astype(np.uint8)).save(mask_path)
+
+                    cutout_filename = f"{target_id}_white.jpg"
+                    cutout_path = cutouts_dir / cutout_filename
+                    cutout_relpath = f"cutouts/{cutout_filename}"
+                    mask_3ch = np.stack([best.mask] * 3, axis=-1)
+                    white_bg = np.ones_like(target_image) * 255
+                    cutout = np.where(mask_3ch, target_image, white_bg)
+                    Image.fromarray(cutout.astype(np.uint8)).save(cutout_path)
+
+                    overlay_filename = f"{target_id}_overlay.jpg"
+                    overlay_path = overlays_dir / overlay_filename
+                    overlay_relpath = f"overlays/{overlay_filename}"
+                    overlay = apply_mask_overlay(target_image, best.mask)
+                    Image.fromarray(overlay).save(overlay_path)
+
+                    db.save_label(
+                        image_id=target_id,
+                        packaging="",
+                        product_name="",
+                        mask_relpath=mask_relpath,
+                        cutout_relpath=cutout_relpath,
+                        overlay_relpath=overlay_relpath,
+                        similarity_score=best.similarity,
+                        created_by="auto",
+                        status="proposed",
+                    )
+                    print(f"[AutoAnnotate] Proposed label for image {target_id} "
+                          f"(similarity={best.similarity:.3f})")
+
+                except Exception as e:
+                    print(f"[AutoAnnotate] Failed for image {target_id}: {e}")
+                    continue
+
+        except Exception as e:
+            print(f"[AutoAnnotate] Auto-annotation failed: {e}")
+
+    def get_proposed(self, product_id: int | None = None) -> list[dict]:
+        """Return all proposed labels with overlay image as base64, optionally filtered by product."""
+        rows = db.get_proposed_labels(product_id)
+        result = []
+        for row in rows:
+            overlay_b64 = None
+            if row.get("overlay_relpath"):
+                overlay_path = Path(OUTPUT_ROOT_DIR) / row["overlay_relpath"]
+                if overlay_path.exists():
+                    try:
+                        img = Image.open(overlay_path).convert("RGB")
+                        overlay_b64 = _image_to_b64_png(np.array(img))
+                    except Exception:
+                        pass
+            result.append({
+                **row,
+                "overlay_b64": overlay_b64,
+            })
+        return result
+
+    def accept_proposed(
+        self, label_id: int, packaging: str, product_name: str, labeler_id: str
+    ) -> dict[str, Any]:
+        """Accept a single proposed label."""
+        try:
+            db.confirm_label(label_id, packaging, product_name, confirmed_by=labeler_id)
+            return {"ok": True, "label_id": label_id, "status": f"✅ Accepted label {label_id}"}
+        except Exception as e:
+            return {"ok": False, "label_id": label_id, "status": f"❌ {e}"}
+
+    def reject_proposed(
+        self, image_id: int
+    ) -> dict[str, Any]:
+        """Reject a proposed label and return image to unlabeled queue."""
+        try:
+            db.reject_proposed_label(image_id)
+            return {"ok": True, "image_id": image_id, "status": f"🗑️ Rejected, image {image_id} back to queue"}
+        except Exception as e:
+            return {"ok": False, "image_id": image_id, "status": f"❌ {e}"}
+
+    def accept_all_proposed(
+        self, product_id: int, packaging: str, product_name: str, labeler_id: str
+    ) -> dict[str, Any]:
+        """Accept all proposed labels for a product in one shot."""
+        rows = db.get_proposed_labels(product_id)
+        accepted, failed = 0, 0
+        for row in rows:
+            try:
+                db.confirm_label(
+                    row["label_id"], packaging, product_name, confirmed_by=labeler_id
+                )
+                accepted += 1
+            except Exception as e:
+                print(f"[AcceptAll] Failed label {row['label_id']}: {e}")
+                failed += 1
+        return {
+            "ok": True,
+            "accepted": accepted,
+            "failed": failed,
+            "status": f"✅ Accepted {accepted} proposed labels" + (f" ({failed} failed)" if failed else ""),
+        }
 
     def reset(self, session_id: str) -> dict[str, Any]:
         state = self.sessions.get(session_id, {})
@@ -282,7 +463,19 @@ class LabelingService:
             overlay_relpath=overlay_relpath,
             similarity_score=None,
             created_by=labeler_id,
+            status="confirmed",
         )
+
+        threading.Thread(
+            target=self.auto_annotate_product,
+            kwargs={
+                "image_id": image_id,
+                "image": state["image_array"].copy(),
+                "mask": state["mask"].copy(),
+                "product_id": state["product_id"],
+            },
+            daemon=True,
+        ).start()
 
         nxt = self.load_next(labeler_id, session_id)
         nxt["status"] = (
